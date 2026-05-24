@@ -24,6 +24,11 @@ func TestWriteValue(t *testing.T) {
 			want:  "-ERR failure\r\n",
 		},
 		{
+			name:  "integer",
+			value: Integer(2),
+			want:  ":2\r\n",
+		},
+		{
 			name:  "bulk string",
 			value: BulkString{Value: "hello"},
 			want:  "$5\r\nhello\r\n",

@@ -9,12 +9,14 @@ import (
 
 	"tiny-redis-go/internal/command"
 	"tiny-redis-go/internal/server"
+	"tiny-redis-go/internal/store"
 )
 
 func main() {
 	logger := log.New(os.Stdout, "[tiny-redis] ", log.LstdFlags|log.Lmsgprefix)
 
-	srv := server.New("0.0.0.0:6379", command.NewRegistry(), logger)
+	db := store.New()
+	srv := server.New("0.0.0.0:6379", command.NewRegistry(db), logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
