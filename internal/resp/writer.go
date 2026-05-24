@@ -31,6 +31,9 @@ func (w *Writer) writeValue(value Value) error {
 	case ErrorString:
 		_, err := fmt.Fprintf(w.writer, "-%s\r\n", string(v))
 		return err
+	case Integer:
+		_, err := fmt.Fprintf(w.writer, ":%d\r\n", int64(v))
+		return err
 	case BulkString:
 		if v.Null {
 			_, err := w.writer.WriteString("$-1\r\n")

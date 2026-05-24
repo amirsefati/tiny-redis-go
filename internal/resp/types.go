@@ -9,6 +9,9 @@ type SimpleString string
 // ErrorString encodes RESP error values like -ERR message.
 type ErrorString string
 
+// Integer encodes RESP integer values like :1.
+type Integer int64
+
 // BulkString encodes RESP bulk string values.
 type BulkString struct {
 	Value string
