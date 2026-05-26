@@ -17,17 +17,22 @@ This project is not intended to be a production-ready Redis replacement. The goa
 
 Built as a 10-day engineering challenge.
 
-## Day 2 Scope
+## Day 3 Scope
 
-Day 2 adds a real in-memory database on top of the Day 1 protocol server:
+Day 3 adds TTL-aware storage and Redis-style expiration behavior on top of the Day 2 store:
 
 - TCP server on `0.0.0.0:6379`
 - Concurrent connection handling with goroutines
 - RESP array and bulk string parsing
 - RESP simple string, error, integer, bulk string, null bulk string, and array encoding
 - Thread-safe in-memory store using `sync.RWMutex`
-- Store-backed commands for `SET`, `GET`, `DEL`, `EXISTS`, and `DBSIZE`
-- Value metadata with type, timestamps, and versioning
+- Store-backed commands for `SET`, `GET`, `DEL`, `EXISTS`, `DBSIZE`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, and `PERSIST`
+- `SET key value EX seconds` and `SET key value PX milliseconds`
+- Value metadata with type, timestamps, versioning, and optional expiration
+- Lazy expiration on read-oriented commands
+- Active expiration with a background cleanup goroutine
+- Configurable sampled cleanup instead of full keyspace scans
+- Expiration statistics for deleted stale keys and cleanup cycles
 - Defensive memory copying on read and write paths
 - Unit tests and benchmarks for the store layer
 
@@ -73,6 +78,11 @@ redis-cli -p 6379 ECHO hello
 redis-cli -p 6379 COMMAND
 redis-cli -p 6379 SET language go
 redis-cli -p 6379 GET language
+redis-cli -p 6379 SET session abc EX 10
+redis-cli -p 6379 TTL session
+redis-cli -p 6379 PTTL session
+redis-cli -p 6379 EXPIRE language 30
+redis-cli -p 6379 PERSIST language
 redis-cli -p 6379 EXISTS language missing
 redis-cli -p 6379 DEL language
 redis-cli -p 6379 DBSIZE
@@ -85,6 +95,8 @@ printf '*1\r\n$4\r\nPING\r\n' | nc localhost 6379
 printf '*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n' | nc localhost 6379
 printf '*3\r\n$3\r\nSET\r\n$8\r\nlanguage\r\n$2\r\ngo\r\n' | nc localhost 6379
 printf '*2\r\n$3\r\nGET\r\n$8\r\nlanguage\r\n' | nc localhost 6379
+printf '*5\r\n$3\r\nSET\r\n$7\r\nsession\r\n$3\r\nabc\r\n$2\r\nPX\r\n$4\r\n1500\r\n' | nc localhost 6379
+printf '*2\r\n$4\r\nPTTL\r\n$7\r\nsession\r\n' | nc localhost 6379
 ```
 
 ## Test
@@ -161,6 +173,98 @@ Copying data protects correctness:
 - future refactors are less likely to introduce aliasing bugs
 
 The downside is more allocation and memory bandwidth use. That tradeoff is fine for Day 2 because correctness and clarity matter more than micro-optimizing the hot path too early.
+
+### Why Redis uses both lazy and active expiration
+
+Expiration is not just a timestamp feature. It is a memory-management strategy.
+
+Lazy expiration keeps the hot path cheap. When a client touches a key through `GET`, `EXISTS`, `TTL`, or `PTTL`, the store checks the key's expiration and deletes it on demand if it is stale. That means keys that are never touched again do not cost work on every tick.
+
+Active expiration solves the opposite problem. If the database only used lazy deletion, expired keys that nobody reads anymore would stay in memory forever. That turns TTL into a logical visibility rule but not a physical cleanup rule. The background worker fixes that by periodically sampling a subset of keys and deleting stale ones.
+
+Using both strategies gives a practical balance:
+
+- lazy deletion keeps normal reads simple and accurate
+- active cleanup prevents dead keys from accumulating in memory
+- sampling limits cleanup cost so latency stays predictable
+
+### Why scanning the entire keyspace is dangerous
+
+A full scan on every cleanup tick sounds simple, but it scales poorly:
+
+- work grows linearly with database size
+- a large keyspace can monopolize the CPU
+- long cleanup pauses can delay foreground requests
+- lock hold times get worse under concurrency
+
+This implementation follows the same broad idea Redis uses: sample a bounded number of keys per cleanup cycle instead of walking the entire map every time. That makes cleanup cost configurable and keeps the tail latency story much healthier.
+
+### How TTL metadata affects memory usage
+
+Every key now carries an extra `ExpiresAt` field. That makes each value slightly larger, and it also means the store may temporarily hold logically expired keys until lazy or active cleanup removes them.
+
+That overhead is the tradeoff for fast expiration decisions:
+
+- reads can decide in constant time whether a key is stale
+- cleanup can delete without consulting another index
+- semantics stay local to the value object
+
+Even in a simple implementation, TTL is already shaping memory layout and lifecycle behavior, not just command syntax.
+
+### Why time handling is subtle
+
+Expiration code looks simple until time semantics get involved.
+
+This project stores expiration as a Unix millisecond timestamp because Redis exposes both second and millisecond TTL commands. That keeps command behavior straightforward, but there are still subtleties:
+
+- `TTL` and `PTTL` need different units
+- rounding can make `TTL` return `0` for a key that still has a few hundred milliseconds left
+- wall-clock time can move unexpectedly if the system clock changes
+- elapsed-time logic is often safer with monotonic clocks than with raw wall-clock timestamps
+
+Go's `time.Time` carries a monotonic component, but `UnixMilli()` does not. For a learning project, Unix milliseconds are a clear fit for the Redis API. For more production-like behavior, it is worth thinking carefully about how internal elapsed-time measurement and external timestamp reporting should interact.
+
+### Locking strategy and lock-upgrade pitfalls
+
+The store uses a two-phase approach for lazy expiration:
+
+- read the key under `RLock`
+- if it looks expired, drop the read lock
+- reacquire a full `Lock`
+- re-check expiration and delete only if it is still stale
+
+That matters because `sync.RWMutex` does not support lock upgrade. Trying to delete while still holding a read lock would either deadlock or force unsafe patterns. Re-checking after acquiring the write lock avoids deleting a key that another goroutine may have refreshed between the read and write phases.
+
+### How expiration will interact with persistence and replication later
+
+TTL has downstream effects beyond memory cleanup.
+
+For persistence:
+
+- snapshots need to decide whether to write absolute expiry times or remaining TTL
+- append-only logs need to record expiration-changing commands consistently
+- loading data back must preserve correct expiration semantics
+
+For replication:
+
+- replicas need deterministic expiration behavior
+- masters often propagate expiration as explicit deletes or expiration commands
+- clock skew becomes a real design concern
+
+That is why expiration is an important systems feature, not just an extra field on a struct.
+
+## Day 3 Post Angle
+
+Suggested title:
+
+**Building Redis from Scratch in Go — Day 3: TTL, Expiration, and Lazy Deletion**
+
+Professional framing:
+
+- expiration is not just a timestamp; it is a memory-management strategy
+- without active cleanup, expired keys can remain in memory indefinitely
+- too much cleanup hurts latency
+- sampling and heuristics are how Redis navigates that tradeoff
 
 ### How Redis stores values internally
 

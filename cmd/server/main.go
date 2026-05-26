@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"tiny-redis-go/internal/command"
 	"tiny-redis-go/internal/server"
@@ -15,7 +16,8 @@ import (
 func main() {
 	logger := log.New(os.Stdout, "[tiny-redis] ", log.LstdFlags|log.Lmsgprefix)
 
-	db := store.New()
+	db := store.New(store.WithActiveExpiration(100*time.Millisecond, 32))
+	defer db.Close()
 	srv := server.New("0.0.0.0:6379", command.NewRegistry(db), logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
