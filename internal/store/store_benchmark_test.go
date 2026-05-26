@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func BenchmarkStoreSet(b *testing.B) {
@@ -29,6 +30,20 @@ func BenchmarkStoreGet(b *testing.B) {
 	}
 }
 
+func BenchmarkStoreGetWithTTLCheck(b *testing.B) {
+	db := New()
+	for i := 0; i < 1024; i++ {
+		db.SetWithTTL(fmt.Sprintf("key:%d", i), []byte("benchmark-value"), time.Minute)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := db.Get(fmt.Sprintf("key:%d", i%1024)); !ok {
+			b.Fatal("expected key to exist")
+		}
+	}
+}
+
 func BenchmarkStoreMixedWorkload(b *testing.B) {
 	db := New()
 
@@ -40,5 +55,19 @@ func BenchmarkStoreMixedWorkload(b *testing.B) {
 			continue
 		}
 		db.Get(key)
+	}
+}
+
+func BenchmarkStoreActiveCleanupCycle(b *testing.B) {
+	db := New(WithActiveExpiration(time.Second, 64))
+	defer db.Close()
+
+	for i := 0; i < 4096; i++ {
+		db.SetWithTTL(fmt.Sprintf("key:%d", i), []byte("benchmark-value"), time.Minute)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db.runActiveExpirationCycle()
 	}
 }
